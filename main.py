@@ -19,6 +19,7 @@ Keys:  c = calibrate range: hold marker at exactly --cal-dist metres, press c
        q = quit
 """
 import argparse
+import glob
 import json
 import math
 import os
@@ -27,10 +28,25 @@ import time
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 CALIB_FILE = "webcam_calib.json"
-MODEL_FILES = ["best.pt", "best (8).pt"]
+PREFERRED_MODELS = [
+    "best.pt",
+    "best (7).pt",
+    "best(7).pt",
+    "best (8).pt",
+    "best (6).pt",
+    "best (4).pt",
+    "best (3).pt",
+    "best (2).pt",
+    "best_prev.pt",
+    "best_30epochs.pt",
+    "best_backup_before_colab.pt",
+    "best_old.pt",
+    "best_old_20260623.pt",
+]
 CAM_INDEX = 0
 FALLBACK_SIZE = (640, 480)
 FALLBACK_DFOV_DEG = 75.0      # rough diagonal field of view of a laptop webcam
@@ -41,7 +57,7 @@ DEFAULT_MARKER_SIZE = 0.10    # default marker side length in metres (100 mm / 1
 # Camera frame (x right, y down, z forward) -> body frame (x forward, y left, z up)
 R_BC = np.array([[0.0, 0.0, 1.0],
                  [-1.0, 0.0, 0.0],
-                 [0.0, -1.0, 0.0]])
+                 [0.0, -1.0, 0.0]], dtype=np.float64)
 
 
 # ---------------- Attitude ----------------
@@ -50,9 +66,9 @@ def R_WB_from_attitude(roll_deg, pitch_deg, yaw_deg):
     Body: x forward, y left, z up. Positive roll = right side down,
     positive pitch = nose down, positive yaw = nose turns from world x toward world y."""
     r, p, y = np.radians([roll_deg, pitch_deg, yaw_deg])
-    Rx = np.array([[1, 0, 0], [0, np.cos(r), -np.sin(r)], [0, np.sin(r), np.cos(r)]])
-    Ry = np.array([[np.cos(p), 0, np.sin(p)], [0, 1, 0], [-np.sin(p), 0, np.cos(p)]])
-    Rz = np.array([[np.cos(y), -np.sin(y), 0], [np.sin(y), np.cos(y), 0], [0, 0, 1]])
+    Rx = np.array([[1, 0, 0], [0, np.cos(r), -np.sin(r)], [0, np.sin(r), np.cos(r)]], dtype=np.float64)
+    Ry = np.array([[np.cos(p), 0, np.sin(p)], [0, 1, 0], [-np.sin(p), 0, np.cos(p)]], dtype=np.float64)
+    Rz = np.array([[np.cos(y), -np.sin(y), 0], [np.sin(y), np.cos(y), 0], [0, 0, 1]], dtype=np.float64)
     return Rz @ Ry @ Rx
 
 
@@ -87,31 +103,36 @@ def print_attitude(roll, pitch, yaw, R_WB):
 def load_camera_model(frame_size):
     """Use webcam_calib.json if it exists, otherwise a rough guess from a typical FOV."""
     if os.path.exists(CALIB_FILE):
-        with open(CALIB_FILE) as f:
-            c = json.load(f)
-        K = np.array([[c["fx"], 0.0, c["cx"]],
-                      [0.0, c["fy"], c["cy"]],
-                      [0.0, 0.0, 1.0]])
-        dist = np.array(c["dist_opencv"], dtype=np.float64)
-        size = (int(c["image_width"]), int(c["image_height"]))
-        return K, dist, size, True
+        try:
+            with open(CALIB_FILE) as f:
+                c = json.load(f)
+            K = np.array([[c["fx"], 0.0, c["cx"]],
+                          [0.0, c["fy"], c["cy"]],
+                          [0.0, 0.0, 1.0]], dtype=np.float64)
+            dist = np.array(c.get("dist_opencv", np.zeros(5)), dtype=np.float64)
+            size = (int(c["image_width"]), int(c["image_height"]))
+            return K, dist, size, True
+        except Exception as e:
+            print(f"Warning: Failed to parse {CALIB_FILE} ({e}). Using estimated camera model.")
 
     W, H = frame_size
     f = (math.hypot(W, H) / 2.0) / math.tan(math.radians(FALLBACK_DFOV_DEG) / 2.0)
     K = np.array([[f, 0.0, (W - 1) / 2.0],
                   [0.0, f, (H - 1) / 2.0],
-                  [0.0, 0.0, 1.0]])
-    print(f"WARNING: {CALIB_FILE} not found. Using a guessed fx = fy = {f:.0f} px, "
+                  [0.0, 0.0, 1.0]], dtype=np.float64)
+    print(f"NOTE: {CALIB_FILE} not found. Using estimated fx = fy = {f:.0f} px, "
           f"centre principal point, no distortion. Angles and ranges are approximate.")
-    return K, np.zeros(5), (W, H), False
+    return K, np.zeros(5, dtype=np.float64), (W, H), False
 
 
 def pixels_to_bearings(pts, K, dist):
     """N pixels (N x 2) -> N unit bearings (N x 3) in the camera frame."""
     pts = np.asarray(pts, dtype=np.float64).reshape(-1, 1, 2)
     xn = cv2.undistortPoints(pts, K, dist).reshape(-1, 2)
-    q = np.hstack([xn, np.ones((len(xn), 1))])
-    return q / np.linalg.norm(q, axis=1, keepdims=True)
+    q = np.hstack([xn, np.ones((len(xn), 1), dtype=np.float64)])
+    norm = np.linalg.norm(q, axis=1, keepdims=True)
+    norm = np.where(norm < 1e-9, 1.0, norm)
+    return q / norm
 
 
 # ---------------- Marker Measurement ----------------
@@ -123,8 +144,10 @@ def measure_marker(box, K, dist, marker_size_m, corners=None):
     The subtended angle theta gives range:
         rho = marker_size / (2 * tan(theta / 2))
     """
+    marker_size_m = max(float(marker_size_m), 1e-4)
+
     if corners is not None and len(corners) == 4:
-        c = corners.reshape(4, 2)
+        c = np.asarray(corners, dtype=np.float64).reshape(4, 2)
         center = c.mean(axis=0)
         # Horizontal bearings (top and bottom edges)
         b0, b1 = pixels_to_bearings([c[0], c[1]], K, dist)
@@ -143,7 +166,7 @@ def measure_marker(box, K, dist, marker_size_m, corners=None):
         x1, y1, x2, y2 = box
         cx_m = (x1 + x2) / 2.0
         cy_m = (y1 + y2) / 2.0
-        center = np.array([cx_m, cy_m])
+        center = np.array([cx_m, cy_m], dtype=np.float64)
 
         p_left = np.array([x1, cy_m])
         p_right = np.array([x2, cy_m])
@@ -157,7 +180,7 @@ def measure_marker(box, K, dist, marker_size_m, corners=None):
 
     # Take maximum dimension to avoid foreshortening errors when tilted
     theta = max(theta_w, theta_h)
-    theta = max(theta, 1e-4)   # prevent division by zero
+    theta = min(max(theta, 1e-4), math.pi - 1e-4)   # prevent division by zero or negative
 
     rho = marker_size_m / (2.0 * math.tan(theta / 2.0))
     b = pixels_to_bearings([center], K, dist)[0]
@@ -187,7 +210,10 @@ def desired_bearing(v_T, v_min):
 
 
 def angle_deg(a, b):
-    return math.degrees(math.acos(float(np.clip(a @ b, -1.0, 1.0))))
+    dot = float(np.clip(a @ b, -1.0, 1.0))
+    if math.isnan(dot):
+        return 0.0
+    return math.degrees(math.acos(dot))
 
 
 def fmt(v, nd=3):
@@ -199,33 +225,90 @@ def side(value, pos, neg):
 
 
 # ---------------- Model & Detector Setup ----------------
+def list_available_models():
+    """List all available .pt models with their training metrics."""
+    models = sorted(glob.glob("*.pt"))
+    if not models:
+        print("No .pt models found in the workspace.")
+        return
+    print("\nAvailable YOLO Models in Workspace:")
+    print("%-28s | %-6s | %-9s | %-6s | %-6s | %-8s" %
+          ("Model File", "Epochs", "Precision", "Recall", "mAP50", "mAP50-95"))
+    print("-" * 75)
+    for f in models:
+        try:
+            ckpt = torch.load(f, map_location="cpu", weights_only=False)
+            m = ckpt.get("train_metrics", {})
+            p = m.get("metrics/precision(B)", 0.0)
+            r = m.get("metrics/recall(B)", 0.0)
+            map50 = m.get("metrics/mAP50(B)", 0.0)
+            map5095 = m.get("metrics/mAP50-95(B)", 0.0)
+            t_args = ckpt.get("train_args", {})
+            epochs = t_args.get("epochs", "?") if isinstance(t_args, dict) else "?"
+            print("%-28s | %-6s | %-9.4f | %-6.4f | %-6.4f | %-8.4f" %
+                  (f, str(epochs), p, r, map50, map5095))
+        except Exception as e:
+            print("%-28s | (could not read metadata: %s)" % (f, e))
+    print()
+
+
 def resolve_model_file(requested_path=None):
-    """Finds best.pt or falls back to best (8).pt."""
-    if requested_path and os.path.exists(requested_path):
-        return requested_path
-    for candidate in MODEL_FILES:
+    """Finds requested model, or preferred best.pt, or falls back to best available."""
+    if requested_path:
+        req = requested_path.strip()
+        if req.lower() == "list":
+            list_available_models()
+            sys.exit(0)
+        # Check exact path
+        if os.path.exists(req):
+            return req
+        # Check if .pt extension was omitted
+        if os.path.exists(req + ".pt"):
+            return req + ".pt"
+        # Check numeric alias (e.g. "8" -> "best (8).pt")
+        for candidate in [f"best ({req}).pt", f"best({req}).pt", f"best_{req}.pt"]:
+            if os.path.exists(candidate):
+                return candidate
+        # If requested explicitly but not found:
+        print(f"Warning: Requested model '{requested_path}' not found. Searching for alternatives...")
+
+    # Look for preferred models
+    for candidate in PREFERRED_MODELS:
         if os.path.exists(candidate):
             return candidate
-    sys.exit(f"Error: Model file '{requested_path or MODEL_FILES[0]}' not found. "
-             f"Please ensure 'best.pt' is in the current folder.")
+
+    # Look for any .pt file in the directory
+    all_pt = sorted(glob.glob("*.pt"))
+    if all_pt:
+        print(f"Using available model: {all_pt[0]}")
+        return all_pt[0]
+
+    sys.exit("Error: No YOLO weights (.pt) found in current directory. Please ensure 'best.pt' is present.")
 
 
 def init_aruco_detectors():
-    """Initializes OpenCV ArUco detectors for corner refinement."""
+    """Initializes OpenCV ArUco detectors for corner refinement across all OpenCV versions."""
     detectors = []
+    if not hasattr(cv2, "aruco"):
+        return detectors
+    dict_ids = [
+        cv2.aruco.DICT_4X4_50,
+        cv2.aruco.DICT_4X4_100,
+        cv2.aruco.DICT_5X5_50,
+        cv2.aruco.DICT_6X6_50,
+    ]
     try:
-        dict_ids = [
-            cv2.aruco.DICT_4X4_50,
-            cv2.aruco.DICT_4X4_100,
-            cv2.aruco.DICT_5X5_50,
-            cv2.aruco.DICT_6X6_50,
-        ]
         params = cv2.aruco.DetectorParameters()
+        has_detector_class = hasattr(cv2.aruco, "ArucoDetector")
         for d_id in dict_ids:
             d = cv2.aruco.getPredefinedDictionary(d_id)
-            detectors.append(cv2.aruco.ArucoDetector(d, params))
-    except Exception:
-        pass
+            if has_detector_class:
+                det = cv2.aruco.ArucoDetector(d, params)
+                detectors.append(("new", det))
+            else:
+                detectors.append(("legacy", (d, params)))
+    except Exception as e:
+        print(f"Note: ArUco subpixel refinement initialization warning: {e}")
     return detectors
 
 
@@ -234,7 +317,7 @@ def refine_with_aruco(frame, box, aruco_detectors):
     if not aruco_detectors:
         return None
     x1, y1, x2, y2 = [int(v) for v in box]
-    pad = 10
+    pad = 12
     h_img, w_img = frame.shape[:2]
     rx1, ry1 = max(0, x1 - pad), max(0, y1 - pad)
     rx2, ry2 = min(w_img, x2 + pad), min(h_img, y2 + pad)
@@ -243,19 +326,88 @@ def refine_with_aruco(frame, box, aruco_detectors):
         return None
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    for det in aruco_detectors:
-        corners, ids, _ = det.detectMarkers(gray)
-        if ids is not None and len(ids) > 0:
-            c = corners[0][0].copy()
-            c[:, 0] += rx1
-            c[:, 1] += ry1
-            return c
+    for mode, item in aruco_detectors:
+        try:
+            if mode == "new":
+                corners, ids, _ = item.detectMarkers(gray)
+            else:
+                d, params = item
+                corners, ids, _ = cv2.aruco.detectMarkers(gray, d, parameters=params)
+            if ids is not None and len(ids) > 0:
+                c = corners[0][0].copy().astype(np.float64)
+                c[:, 0] += rx1
+                c[:, 1] += ry1
+                return c
+        except Exception:
+            continue
     return None
+
+
+def open_video_source(source, width=None, height=None):
+    """Robust camera or video/image source opener with multi-backend fallback."""
+    is_cam = False
+    try:
+        cam_idx = int(source)
+        is_cam = True
+    except (ValueError, TypeError):
+        cam_idx = None
+
+    if is_cam:
+        backends = []
+        if sys.platform.startswith("win"):
+            backends = [
+                ("DirectShow", cv2.CAP_DSHOW),
+                ("MSMF", cv2.CAP_MSMF),
+                ("Default", cv2.CAP_ANY),
+            ]
+        else:
+            backends = [("Default", cv2.CAP_ANY)]
+
+        for b_name, b_flag in backends:
+            cap = cv2.VideoCapture(cam_idx, b_flag)
+            if cap.isOpened():
+                if width and height:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    print(f"Connected to camera index {cam_idx} using {b_name} backend ({frame.shape[1]}x{frame.shape[0]}).")
+                    return cap, frame, True
+                cap.release()
+
+        # If selected camera index failed, probe available cameras 0..3
+        avail = []
+        for idx in range(4):
+            c_test = cv2.VideoCapture(idx, cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY)
+            if c_test.isOpened():
+                r, _ = c_test.read()
+                if r:
+                    avail.append(idx)
+                c_test.release()
+
+        err_msg = f"Could not read from camera index {cam_idx}."
+        if avail:
+            err_msg += f" Detected active camera index(es): {avail}. Please run with --cam {avail[0]}."
+        else:
+            err_msg += " No active webcam detected. Please verify camera connection or test with a video/image using --source path."
+        sys.exit(f"Error: {err_msg}")
+    else:
+        src_path = str(source)
+        if not os.path.exists(src_path):
+            sys.exit(f"Error: Source file '{src_path}' not found.")
+        cap = cv2.VideoCapture(src_path)
+        if not cap.isOpened():
+            sys.exit(f"Error: Could not open media file '{src_path}'.")
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            sys.exit(f"Error: Could not read frame from '{src_path}'.")
+        print(f"Opened media source '{src_path}' ({frame.shape[1]}x{frame.shape[0]}).")
+        return cap, frame, False
 
 
 # ---------------- Display: White side panel ----------------
 PANEL_W = 540
-PANEL_MIN_H = 740
+PANEL_MIN_H = 780
 MAT_COL_RIGHT = (230, 340, 450)
 FONT = cv2.FONT_HERSHEY_DUPLEX
 STYLES = {
@@ -266,6 +418,11 @@ STYLES = {
     "held": ((0, 120, 230), 0.65, 28),     # orange: held value
     "gap":  (None, 0.0, 10),               # empty space
 }
+
+
+def get_required_panel_height(rows):
+    """Compute required height to avoid text clipping."""
+    return sum(STYLES[style][2] for _, style in rows) + 30
 
 
 def make_panel(rows, height):
@@ -310,15 +467,18 @@ def label_on_video(img, text, org, color=(255, 255, 255), bg_color=(0, 0, 0)):
 # ---------------- Main Execution ----------------
 def main():
     p = argparse.ArgumentParser(description="Drone Target: ArUco marker live bearing and range tracking.")
-    p.add_argument("--model", type=str, default="best.pt", help="path to YOLO weights (.pt)")
+    p.add_argument("--model", type=str, default="best.pt",
+                   help="path to YOLO weights (.pt), or 'list' to show all models and their metrics")
     p.add_argument("--marker-size", type=float, default=DEFAULT_MARKER_SIZE,
                    help=f"marker side length in metres (default {DEFAULT_MARKER_SIZE:.2f} m = {DEFAULT_MARKER_SIZE*1000:.0f} mm)")
     p.add_argument("--ipd", type=float, default=None, help="alias for --marker-size")
     p.add_argument("--cal-dist", type=float, default=1.0, help="distance in metres when pressing c to calibrate")
-    p.add_argument("--conf", type=float, default=0.25, help="detection confidence threshold")
-    p.add_argument("--imgsz", type=int, default=480, help="inference image size")
+    p.add_argument("--conf", type=float, default=0.25, help="detection confidence threshold (default 0.25)")
+    p.add_argument("--imgsz", type=int, default=640, help="inference image size (default 640)")
     p.add_argument("--target-id", type=str, default=None, help="specific marker class to track (e.g. '41')")
-    p.add_argument("--cam", type=int, default=CAM_INDEX, help="camera device index")
+    p.add_argument("--cam", type=int, default=CAM_INDEX, help="camera device index (default 0)")
+    p.add_argument("--source", type=str, default=None, help="input source: camera index or video/image file path")
+    p.add_argument("--device", type=str, default="", help="inference device: '' (auto), 'cuda', 'cpu', or device id")
     p.add_argument("--roll", type=float, default=0.0, help="camera/body roll in degrees")
     p.add_argument("--pitch", type=float, default=0.0, help="camera/body pitch in degrees")
     p.add_argument("--yaw", type=float, default=0.0, help="camera/body yaw in degrees")
@@ -328,36 +488,43 @@ def main():
 
     marker_size = args.ipd if args.ipd is not None else args.marker_size
 
+    # Resolve and load model
     model_file = resolve_model_file(args.model)
+    print("\n" + "=" * 60)
     print(f"Loading YOLO model from: {model_file}...")
     model = YOLO(model_file)
-    print(f"Loaded successfully. Available marker classes: {model.names}")
+    print("Model loaded successfully.")
+    print(f"Available marker classes: {model.names}")
+    dev = args.device if args.device else ("CUDA GPU" if torch.cuda.is_available() else "CPU")
+    print(f"Inference device: {dev} | Image size: {args.imgsz}px | Confidence threshold: {args.conf}")
+    print("=" * 60 + "\n")
 
     aruco_detectors = init_aruco_detectors()
 
-    backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY
-    cap = cv2.VideoCapture(args.cam, backend)
+    # Determine camera or video source
+    source = args.source if args.source is not None else args.cam
     want = FALLBACK_SIZE
     if os.path.exists(CALIB_FILE):
-        with open(CALIB_FILE) as f:
-            c = json.load(f)
-        want = (int(c["image_width"]), int(c["image_height"]))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, want[0])
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, want[1])
+        try:
+            with open(CALIB_FILE) as f:
+                c = json.load(f)
+            want = (int(c["image_width"]), int(c["image_height"]))
+        except Exception:
+            pass
 
-    ok, frame = cap.read()
-    if not ok:
-        sys.exit(f"Could not read from camera index {args.cam}. Please check connection.")
-    H, W = frame.shape[:2]
+    cap, initial_frame, is_webcam = open_video_source(source, want[0], want[1])
+    H, W = initial_frame.shape[:2]
     K, dist, size, calibrated = load_camera_model((W, H))
     if calibrated and size != (W, H):
-        sys.exit(f"Camera gives {W}x{H}, but calibration is for {size[0]}x{size[1]}.")
+        print(f"Warning: Camera frame is {W}x{H}, but calibration is for {size[0]}x{size[1]}. Using fallback.")
+        K, dist, size, calibrated = load_camera_model((W, H))
 
     cx, cy = int(round(K[0, 2])), int(round(K[1, 2]))
     win = "Drone Detection - ArUco Marker Bearing Demo (c = calibrate, q = quit)"
 
     try:
-        run_loop(cap, model, aruco_detectors, K, dist, marker_size, args, cx, cy, W, H, calibrated, win)
+        run_loop(cap, model, aruco_detectors, K, dist, marker_size, args, cx, cy, W, H, calibrated, win,
+                 is_webcam=is_webcam, model_file=model_file)
     except KeyboardInterrupt:
         print("\nStopped with Ctrl+C.")
     finally:
@@ -365,38 +532,60 @@ def main():
         cv2.destroyAllWindows()
 
 
-def run_loop(cap, model, aruco_detectors, K, dist, marker_size, args, cx, cy, W, H, calibrated, win):
+def run_loop(cap, model, aruco_detectors, K, dist, marker_size, args, cx, cy, W, H, calibrated, win,
+             is_webcam=True, model_file="best.pt"):
     r_B_smooth = None
     last = None
     frame_no = 0
     R_WB = R_WB_from_attitude(args.roll, args.pitch, args.yaw)
     print_attitude(args.roll, args.pitch, args.yaw, R_WB)
     att_rows = attitude_rows(args.roll, args.pitch, args.yaw, R_WB)
-    v_L = np.zeros(3)
+    v_L = np.zeros(3, dtype=np.float64)
     r_W_prev = None
     t_prev = None
     v_T = None
     g_star = None
 
-    panel_h = max(H, PANEL_MIN_H)
+    fps_smooth = None
+    t_last_frame = None
+
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, W + PANEL_W, panel_h)
+    cv2.resizeWindow(win, W + PANEL_W, max(H, PANEL_MIN_H))
 
     while True:
         ok, frame = cap.read()
         if not ok:
-            break
+            if not is_webcam:
+                # Video file: loop back to beginning
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = cap.read()
+            if not ok:
+                print("End of stream or disconnected.")
+                break
+
         t_now = time.perf_counter()
         frame_no += 1
 
+        # FPS calculation
+        dt_frame = t_now - (t_last_frame if t_last_frame is not None else t_now)
+        t_last_frame = t_now
+        fps = (1.0 / dt_frame) if dt_frame > 0 else 0.0
+        fps_smooth = fps if fps_smooth is None else (0.9 * fps_smooth + 0.1 * fps)
+
         # Run YOLO inference
-        results = model.predict(frame, conf=args.conf, imgsz=args.imgsz, verbose=False)[0]
+        t_inf_start = time.perf_counter()
+        predict_kwargs = dict(conf=args.conf, imgsz=args.imgsz, verbose=False)
+        if args.device:
+            predict_kwargs["device"] = args.device
+        results = model.predict(frame, **predict_kwargs)[0]
+        infer_ms = (time.perf_counter() - t_inf_start) * 1000.0
         boxes = results.boxes
 
         # ---------- Video side ----------
         view = frame.copy()
         cv2.drawMarker(view, (cx, cy), (0, 255, 0), cv2.MARKER_CROSS, 20, 1)
         label_on_video(view, "straight ahead", (cx + 10, cy - 10))
+        label_on_video(view, f"FPS: {fps_smooth:.1f} ({infer_ms:.0f}ms)", (12, 24), color=(0, 255, 120))
 
         rows = [("WHERE THE MARKER IS   (camera = origin)", "head")]
 
@@ -404,8 +593,8 @@ def run_loop(cap, model, aruco_detectors, K, dist, marker_size, args, cx, cy, W,
         if len(boxes) > 0:
             for b_idx in range(len(boxes)):
                 xyxy = boxes.xyxy[b_idx].cpu().numpy()
-                conf = float(boxes.conf[b_idx].cpu().numpy())
-                cls_id = int(boxes.cls[b_idx].cpu().numpy())
+                conf = float(boxes.conf[b_idx].item())
+                cls_id = int(boxes.cls[b_idx].item())
                 cls_name = model.names.get(cls_id, str(cls_id))
 
                 if args.target_id is not None and str(cls_name) != str(args.target_id):
@@ -424,9 +613,10 @@ def run_loop(cap, model, aruco_detectors, K, dist, marker_size, args, cx, cy, W,
 
         if not detected_candidates:
             r_W_prev = None
+            t_prev = None
             rows += [("No marker detected - show ArUco marker to camera", "warn")]
         else:
-            # Pick candidate with largest area
+            # Pick candidate with largest area (closest marker)
             target = max(detected_candidates, key=lambda c: c["area"])
             target_box = target["box"]
             cls_name = target["cls_name"]
@@ -464,7 +654,7 @@ def run_loop(cap, model, aruco_detectors, K, dist, marker_size, args, cx, cy, W,
             az = math.degrees(math.atan2(-left, fwd))
             el = math.degrees(math.atan2(up, math.hypot(fwd, left)))
 
-            b_B = r_B_smooth / rho
+            b_B = r_B_smooth / max(rho, 1e-6)
             g_LT = R_WB @ b_B
 
             label_on_video(view, f"Marker {cls_name} ({conf:.2f}) | {rho:.2f} m",
@@ -473,7 +663,7 @@ def run_loop(cap, model, aruco_detectors, K, dist, marker_size, args, cx, cy, W,
             # ---------- Target velocity in world axes ----------
             r_W = R_WB @ r_B_smooth
             dt = None
-            if r_W_prev is not None:
+            if r_W_prev is not None and t_prev is not None:
                 dt = t_now - t_prev
                 if dt > 0:
                     v_raw = velocity_from_positions(r_W, r_W_prev, dt, v_L)
@@ -516,7 +706,7 @@ def run_loop(cap, model, aruco_detectors, K, dist, marker_size, args, cx, cy, W,
                 rows += [(f"v_T      {fmt(v_T, 2)} m/s", "text"),
                          (f"Speed    {speed:.2f} m/s   -> {state}  (threshold {args.vmin:.2f})", "text")]
 
-            if frame_no % 15 == 0:
+            if frame_no % 30 == 0:
                 print(f"[Marker {cls_name}] rho {rho:.2f} m | r_B = [fwd {fwd:+.2f}, left {left:+.2f}, up {up:+.2f}] m"
                       f" | marker angle {math.degrees(m['theta']):.2f} deg"
                       + (f" | dt {dt * 1000:.0f} ms" if dt else ""))
@@ -533,30 +723,46 @@ def run_loop(cap, model, aruco_detectors, K, dist, marker_size, args, cx, cy, W,
         # ---------- Attitude and R_WB ----------
         rows += att_rows
 
-        # ---------- Settings ----------
-        rows += [("", "gap"), ("SETTINGS", "head"),
-                 (f"Marker size: {marker_size * 1000:.1f} mm", "note")]
+        # ---------- Settings & Status ----------
+        rows += [
+            ("", "gap"),
+            ("SETTINGS & STATUS", "head"),
+            (f"Marker size: {marker_size * 1000:.1f} mm", "note"),
+            (f"Model: {os.path.basename(model_file)} ({args.imgsz}px)", "note"),
+            (f"Perf: {fps_smooth:.1f} FPS (inf {infer_ms:.1f} ms)", "note"),
+        ]
         if not calibrated:
-            rows.append(("Camera NOT CALIBRATED - values are approximate", "warn"))
+            rows.append(("Camera NOT CALIBRATED - values approximate", "warn"))
         rows.append(("Keys:   c = calibrate range      q = quit", "note"))
 
-        # Put video and panel side by side
+        # Put video and panel side by side with dynamic panel height
+        req_h = get_required_panel_height(rows)
+        panel_h = max(H, PANEL_MIN_H, req_h)
+
         if H < panel_h:
             view = np.vstack([view, np.zeros((panel_h - H, W, 3), np.uint8)])
-        cv2.imshow(win, np.hstack([view, make_panel(rows, panel_h)]))
+        elif H > panel_h:
+            panel_h = H
+
+        panel_img = make_panel(rows, panel_h)
+        combined = np.hstack([view, panel_img])
+        cv2.imshow(win, combined)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
+        if key in (ord("q"), ord("Q"), 27):  # 'q' or ESC
+            print("\nExiting on user request.")
             break
         if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+            print("\nWindow closed.")
             break
-        if key == ord("c"):
+        if key in (ord("c"), ord("C")):
             if last is None:
                 print("No marker visible - cannot calibrate.")
             else:
                 marker_size = 2.0 * args.cal_dist * math.tan(last["theta"] / 2.0)
                 r_B_smooth = None
                 r_W_prev = None
+                t_prev = None
                 v_T = None
                 print(f"Calibrated at {args.cal_dist:.2f} m: effective marker size = "
                       f"{marker_size * 1000:.1f} mm. Restart with --marker-size {marker_size:.4f} to reuse it.")
