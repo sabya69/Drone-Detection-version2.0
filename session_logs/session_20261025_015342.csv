@@ -1,0 +1,1 @@
+timestamp,session_time_sec,frame_no,target_id,detector,confidence,distance_m,azimuth_deg,elevation_deg,body_fwd_m,body_left_m,body_up_m,bearing_world_x,bearing_world_y,bearing_world_z,desired_bearing_x,desired_bearing_y,desired_bearing_z,angle_to_desired_deg,vel_world_x,vel_world_y,vel_world_z,speed_mps,target_state,roll_deg,pitch_deg,yaw_deg,bbox_x1,bbox_y1,bbox_x2,bbox_y2,fps
