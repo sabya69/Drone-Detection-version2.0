@@ -33,6 +33,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# If running on Linux without an active X11/Wayland display (e.g. SSH), use offscreen Qt platform
+if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 import cv2
 import numpy as np
@@ -331,7 +334,7 @@ def fast_detect_aruco(frame, aruco_detectors, target_id=None):
                     continue
 
                 x1, y1 = float(c[:, 0].min()), float(c[:, 0].min())
-                x2, y2 = float(c[:, 0].max()), float(c[:, 0].max())
+                x2, y2 = float(c[:, 0].max()), float(c[:, 1].max())
                 box = np.array([x1, y1, x2, y2], dtype=np.float64)
                 return {
                     "box": box,
@@ -831,6 +834,7 @@ def main():
                    help="enable selfie/podcast mirror mode (horizontal flip)")
     p.add_argument("--port", type=int, default=5000, help="port for live web streaming studio (default 5000)")
     p.add_argument("--no-web", action="store_true", default=False, help="disable built-in web stream")
+    p.add_argument("--headless", action="store_true", default=False, help="force headless mode (no local GUI window, web stream only)")
 
     args = p.parse_args()
 
@@ -891,12 +895,23 @@ def main():
 
     win = "Drone Target Tracking - Live Studio Mirror (m = mirror, c = calibrate, q = quit)"
     has_gui = True
-    try:
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win, W + PANEL_W, max(H, PANEL_MIN_H))
-    except Exception:
+    if args.headless:
         has_gui = False
-        print("Note: Running headless without GUI display. Web stream is fully active!")
+    elif sys.platform.startswith("linux"):
+        display = os.environ.get("DISPLAY")
+        wayland = os.environ.get("WAYLAND_DISPLAY")
+        if not display and not wayland:
+            has_gui = False
+
+    if has_gui:
+        try:
+            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(win, W + PANEL_W, max(H, PANEL_MIN_H))
+        except Exception:
+            has_gui = False
+
+    if not has_gui:
+        print(f"Headless mode active (no local window). Access live feed via http://{get_local_ip()}:{args.port}")
 
     try:
         run_loop(cam_reader, yolo_worker, aruco_detectors, K, dist, marker_size, args,
@@ -908,7 +923,10 @@ def main():
         yolo_worker.stop()
         cam_reader.release()
         if has_gui:
-            cv2.destroyAllWindows()
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
         if web_server:
             web_server.shutdown()
 
@@ -1191,6 +1209,9 @@ def run_loop(cam_reader, yolo_worker, aruco_detectors, K, dist, marker_size, arg
                               f"{marker_size * 1000:.1f} mm. Restart with --marker-size {marker_size:.4f} to reuse it.")
             except Exception:
                 has_gui = False
+        else:
+            # Headless loop pacing
+            time.sleep(0.005)
 
 
 if __name__ == "__main__":
