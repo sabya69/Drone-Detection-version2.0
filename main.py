@@ -21,10 +21,14 @@ Keys:
   q = quit (or ESC)
 """
 import argparse
+import atexit
+import csv
+from datetime import datetime
 import glob
 import json
 import math
 import os
+import shutil
 import socket
 import sys
 import threading
@@ -379,6 +383,221 @@ def refine_with_aruco(frame, box, aruco_detectors):
     return None
 
 
+# ---------------- Session CSV Data Logger ----------------
+class SessionDataLogger:
+    """Logs session tracking data values to CSV in real-time and finalizes after every session."""
+
+    FIELDNAMES = [
+        "timestamp",
+        "session_time_sec",
+        "frame_no",
+        "target_id",
+        "detector",
+        "confidence",
+        "distance_m",
+        "azimuth_deg",
+        "elevation_deg",
+        "body_fwd_m",
+        "body_left_m",
+        "body_up_m",
+        "bearing_world_x",
+        "bearing_world_y",
+        "bearing_world_z",
+        "desired_bearing_x",
+        "desired_bearing_y",
+        "desired_bearing_z",
+        "angle_to_desired_deg",
+        "vel_world_x",
+        "vel_world_y",
+        "vel_world_z",
+        "speed_mps",
+        "target_state",
+        "roll_deg",
+        "pitch_deg",
+        "yaw_deg",
+        "bbox_x1",
+        "bbox_y1",
+        "bbox_x2",
+        "bbox_y2",
+        "fps",
+    ]
+
+    def __init__(self, log_dir="session_logs", custom_filename=None, enabled=True, log_all_frames=False):
+        self.enabled = enabled
+        self.log_all_frames = log_all_frames
+        self.record_count = 0
+        self.file = None
+        self.writer = None
+        self.filepath = None
+        self.latest_copy_path = "session_data.csv"
+        self.start_time = time.perf_counter()
+        self.closed = False
+
+        if not self.enabled:
+            return
+
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            if custom_filename:
+                fname = custom_filename if custom_filename.lower().endswith(".csv") else f"{custom_filename}.csv"
+            else:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                fname = f"session_{ts}.csv"
+            self.filepath = os.path.join(log_dir, fname)
+            self.file = open(self.filepath, mode="w", newline="", encoding="utf-8")
+            self.writer = csv.DictWriter(self.file, fieldnames=self.FIELDNAMES)
+            self.writer.writeheader()
+            self.file.flush()
+            print(f"[CSV Logger] Session data will be saved to: {self.filepath}")
+        except Exception as e:
+            print(f"[CSV Logger] Warning: Could not initialize CSV file: {e}")
+            self.enabled = False
+
+    def log_detection(self, frame_no, target_info, rho, az, el, r_B, g_LT, g_star, v_T, args_vmin, fps,
+                      roll=0.0, pitch=0.0, yaw=0.0):
+        if not self.enabled or self.writer is None or self.closed:
+            return
+
+        now = datetime.now()
+        elapsed = time.perf_counter() - self.start_time
+        fwd, left, up = r_B
+        target_box = target_info.get("box", [0, 0, 0, 0])
+
+        g_star_x = f"{g_star[0]:.4f}" if g_star is not None else ""
+        g_star_y = f"{g_star[1]:.4f}" if g_star is not None else ""
+        g_star_z = f"{g_star[2]:.4f}" if g_star is not None else ""
+        ang_deg = f"{angle_deg(g_LT, g_star):.2f}" if g_star is not None else ""
+
+        if v_T is not None:
+            speed = float(np.linalg.norm(v_T))
+            state = "moving" if speed > args_vmin else "still"
+            v_x = f"{v_T[0]:.4f}"
+            v_y = f"{v_T[1]:.4f}"
+            v_z = f"{v_T[2]:.4f}"
+            speed_str = f"{speed:.4f}"
+        else:
+            state = ""
+            v_x = ""
+            v_y = ""
+            v_z = ""
+            speed_str = ""
+
+        row = {
+            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "session_time_sec": f"{elapsed:.3f}",
+            "frame_no": frame_no,
+            "target_id": str(target_info.get("cls_name", "")),
+            "detector": str(target_info.get("detector", "")),
+            "confidence": f"{float(target_info.get('conf', 1.0)):.4f}",
+            "distance_m": f"{rho:.4f}",
+            "azimuth_deg": f"{az:.2f}",
+            "elevation_deg": f"{el:.2f}",
+            "body_fwd_m": f"{fwd:.4f}",
+            "body_left_m": f"{left:.4f}",
+            "body_up_m": f"{up:.4f}",
+            "bearing_world_x": f"{g_LT[0]:.4f}",
+            "bearing_world_y": f"{g_LT[1]:.4f}",
+            "bearing_world_z": f"{g_LT[2]:.4f}",
+            "desired_bearing_x": g_star_x,
+            "desired_bearing_y": g_star_y,
+            "desired_bearing_z": g_star_z,
+            "angle_to_desired_deg": ang_deg,
+            "vel_world_x": v_x,
+            "vel_world_y": v_y,
+            "vel_world_z": v_z,
+            "speed_mps": speed_str,
+            "target_state": state,
+            "roll_deg": f"{roll:.2f}",
+            "pitch_deg": f"{pitch:.2f}",
+            "yaw_deg": f"{yaw:.2f}",
+            "bbox_x1": int(round(target_box[0])),
+            "bbox_y1": int(round(target_box[1])),
+            "bbox_x2": int(round(target_box[2])),
+            "bbox_y2": int(round(target_box[3])),
+            "fps": f"{fps:.1f}",
+        }
+
+        try:
+            self.writer.writerow(row)
+            self.record_count += 1
+            if self.record_count % 15 == 0:
+                self.file.flush()
+        except Exception as e:
+            print(f"[CSV Logger] Write error: {e}")
+
+    def log_empty_frame(self, frame_no, fps, roll=0.0, pitch=0.0, yaw=0.0):
+        if not self.enabled or not self.log_all_frames or self.writer is None or self.closed:
+            return
+
+        now = datetime.now()
+        elapsed = time.perf_counter() - self.start_time
+        row = {
+            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "session_time_sec": f"{elapsed:.3f}",
+            "frame_no": frame_no,
+            "target_id": "none",
+            "detector": "none",
+            "confidence": "0.0000",
+            "distance_m": "",
+            "azimuth_deg": "",
+            "elevation_deg": "",
+            "body_fwd_m": "",
+            "body_left_m": "",
+            "body_up_m": "",
+            "bearing_world_x": "",
+            "bearing_world_y": "",
+            "bearing_world_z": "",
+            "desired_bearing_x": "",
+            "desired_bearing_y": "",
+            "desired_bearing_z": "",
+            "angle_to_desired_deg": "",
+            "vel_world_x": "",
+            "vel_world_y": "",
+            "vel_world_z": "",
+            "speed_mps": "",
+            "target_state": "no_target",
+            "roll_deg": f"{roll:.2f}",
+            "pitch_deg": f"{pitch:.2f}",
+            "yaw_deg": f"{yaw:.2f}",
+            "bbox_x1": "",
+            "bbox_y1": "",
+            "bbox_x2": "",
+            "bbox_y2": "",
+            "fps": f"{fps:.1f}",
+        }
+        try:
+            self.writer.writerow(row)
+            self.record_count += 1
+            if self.record_count % 30 == 0:
+                self.file.flush()
+        except Exception:
+            pass
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+
+        if not self.enabled or self.file is None:
+            return
+
+        try:
+            self.file.flush()
+            self.file.close()
+            self.file = None
+
+            if self.filepath and os.path.exists(self.filepath):
+                shutil.copyfile(self.filepath, self.latest_copy_path)
+                print("\n" + "=" * 65)
+                print(" [CSV Logger] Session data stored successfully!")
+                print(f"   - Total records logged: {self.record_count}")
+                print(f"   - Session file:         {self.filepath}")
+                print(f"   - Latest copy:          {self.latest_copy_path}")
+                print("=" * 65 + "\n")
+        except Exception as e:
+            print(f"[CSV Logger] Error finalizing CSV file: {e}")
+
+
 # ---------------- Threaded Zero-Lag Camera ----------------
 class ThreadedCamera:
     """Non-blocking camera grabber thread that guarantees real-time 30 FPS.
@@ -538,6 +757,8 @@ class AppState:
         self.latest_jpeg = None
         self.lock = threading.Lock()
         self.status_msg = "Live Studio Streaming"
+        self.csv_records = 0
+        self.csv_file = ""
 
     def set_jpeg(self, jpeg_bytes):
         with self.lock:
@@ -646,7 +867,10 @@ class StreamRequestHandler(BaseHTTPRequestHandler):
 <body>
     <header>
         <h1>🎥 Drone Bearing & Target Tracking</h1>
-        <span class="badge">Live Podcast & Studio Mirror</span>
+        <div style="display: flex; gap: 8px; align-items: center;">
+            <span class="badge" style="background:#143826; color:#00e575; border:1px solid #00875f;">📊 CSV Telemetry Active</span>
+            <span class="badge">Live Podcast & Studio Mirror</span>
+        </div>
     </header>
     <div class="controls">
         <button id="btn-mirror" class="{'btn-active' if app_state.mirror_mode else ''}" onclick="apiCall('/api/toggle_mirror')">
@@ -727,7 +951,7 @@ class StreamRequestHandler(BaseHTTPRequestHandler):
             resp["msg"] = f"Hybrid Mode: {'ENABLED (ArUco + Async YOLO)' if app_state.enable_yolo else 'DISABLED (Fast ArUco Only)'}"
         elif self.path == "/api/quit":
             app_state.running = False
-            resp["msg"] = "Stopping server and tracker..."
+            resp["msg"] = "Stopping tracker and saving session CSV data..."
         else:
             self.send_error(404, "Not Found")
             return
@@ -835,6 +1059,14 @@ def main():
     p.add_argument("--port", type=int, default=5000, help="port for live web streaming studio (default 5000)")
     p.add_argument("--no-web", action="store_true", default=False, help="disable built-in web stream")
     p.add_argument("--headless", action="store_true", default=False, help="force headless mode (no local GUI window, web stream only)")
+    p.add_argument("--no-csv", action="store_true", default=False,
+                   help="disable saving session data to CSV")
+    p.add_argument("--csv-dir", type=str, default="session_logs",
+                   help="directory to save session CSV files (default: session_logs)")
+    p.add_argument("--csv-name", type=str, default=None,
+                   help="custom filename for session CSV (default: session_YYYYMMDD_HHMMSS.csv)")
+    p.add_argument("--csv-all-frames", action="store_true", default=False,
+                   help="log every frame to CSV even when no target is detected")
 
     args = p.parse_args()
 
@@ -893,6 +1125,17 @@ def main():
     if not args.no_web:
         web_server = start_web_server(port=args.port)
 
+    # Initialize Session CSV Logger
+    csv_logger = SessionDataLogger(
+        log_dir=args.csv_dir,
+        custom_filename=args.csv_name,
+        enabled=not args.no_csv,
+        log_all_frames=args.csv_all_frames
+    )
+    atexit.register(csv_logger.close)
+    if csv_logger.enabled and csv_logger.filepath:
+        app_state.csv_file = csv_logger.filepath
+
     win = "Drone Target Tracking - Live Studio Mirror (m = mirror, c = calibrate, q = quit)"
     has_gui = True
     if args.headless:
@@ -915,13 +1158,16 @@ def main():
 
     try:
         run_loop(cam_reader, yolo_worker, aruco_detectors, K, dist, marker_size, args,
-                 cx, cy, W, H, calibrated, win, has_gui=has_gui, model_file=model_file)
+                 cx, cy, W, H, calibrated, win, has_gui=has_gui, model_file=model_file,
+                 csv_logger=csv_logger)
     except KeyboardInterrupt:
         print("\nStopped with Ctrl+C.")
     finally:
         app_state.running = False
         yolo_worker.stop()
         cam_reader.release()
+        if csv_logger:
+            csv_logger.close()
         if has_gui:
             try:
                 cv2.destroyAllWindows()
@@ -932,7 +1178,8 @@ def main():
 
 
 def run_loop(cam_reader, yolo_worker, aruco_detectors, K, dist, marker_size, args,
-             cx, cy, W, H, calibrated, win, has_gui=True, model_file="best.pt"):
+             cx, cy, W, H, calibrated, win, has_gui=True, model_file="best.pt",
+             csv_logger=None):
     r_B_smooth = None
     last = None
     frame_no = 0
@@ -1046,6 +1293,8 @@ def run_loop(cam_reader, yolo_worker, aruco_detectors, K, dist, marker_size, arg
             r_W_prev = None
             t_prev = None
             rows += [("No marker detected - show ArUco marker to camera", "warn")]
+            if csv_logger:
+                csv_logger.log_empty_frame(frame_no, fps_smooth, roll=args.roll, pitch=args.pitch, yaw=args.yaw)
         else:
             target_box = detected_target["box"]
             cls_name = detected_target["cls_name"]
@@ -1144,6 +1393,25 @@ def run_loop(cam_reader, yolo_worker, aruco_detectors, K, dist, marker_size, arg
                 rows += [(f"v_T      {fmt(v_T, 2)} m/s", "text"),
                          (f"Speed    {speed:.2f} m/s   -> {state}  (threshold {args.vmin:.2f})", "text")]
 
+            if csv_logger:
+                csv_logger.log_detection(
+                    frame_no=frame_no,
+                    target_info=detected_target,
+                    rho=rho,
+                    az=az,
+                    el=el,
+                    r_B=r_B_smooth,
+                    g_LT=g_LT,
+                    g_star=g_star,
+                    v_T=v_T,
+                    args_vmin=args.vmin,
+                    fps=fps_smooth,
+                    roll=args.roll,
+                    pitch=args.pitch,
+                    yaw=args.yaw
+                )
+                app_state.csv_records = csv_logger.record_count
+
             if frame_no % 45 == 0:
                 print(f"[Marker {cls_name}] rho {rho:.2f}m | r_B=[{fwd:+.2f}, {left:+.2f}, {up:+.2f}]m"
                       f" | g_LT {fmt(g_LT)}"
@@ -1153,6 +1421,7 @@ def run_loop(cam_reader, yolo_worker, aruco_detectors, K, dist, marker_size, arg
         rows += att_rows
 
         # ---------- Settings & Status ----------
+        csv_status_str = f"Active ({csv_logger.record_count} rows)" if (csv_logger and csv_logger.enabled) else "Disabled"
         rows += [
             ("", "gap"),
             ("SETTINGS & STATUS", "head"),
@@ -1160,6 +1429,7 @@ def run_loop(cam_reader, yolo_worker, aruco_detectors, K, dist, marker_size, arg
             (f"Mirror Mode: {'ON (Podcast / Studio)' if is_mirror else 'OFF (Direct)'}", "note"),
             (f"Tracker: {active_detector}", "note"),
             (f"Live FPS: {fps_smooth:.1f} FPS (inf {infer_ms:.1f} ms)", "note"),
+            (f"CSV Telemetry: {csv_status_str}", "note"),
         ]
         if not calibrated:
             rows.append(("Camera NOT CALIBRATED - values approximate", "warn"))
