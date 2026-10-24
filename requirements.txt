@@ -1,0 +1,6 @@
+# Core Computer Vision & AI dependencies for Raspberry Pi
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0
+opencv-contrib-python>=4.8.0
+numpy>=1.23.0
