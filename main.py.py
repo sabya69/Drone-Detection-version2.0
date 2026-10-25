@@ -48,6 +48,8 @@ from ultralytics import YOLO
 
 CALIB_FILE = "webcam_calib.json"
 PREFERRED_MODELS = [
+    "best (11).pt",
+    "best(11).pt",
     "best.pt",
     "best (7).pt",
     "best(7).pt",
@@ -1064,7 +1066,7 @@ def main():
                    help=f"marker side length in metres (default {DEFAULT_MARKER_SIZE:.2f} m)")
     p.add_argument("--ipd", type=float, default=None, help="alias for --marker-size")
     p.add_argument("--cal-dist", type=float, default=1.0, help="distance in metres when calibrating (c)")
-    p.add_argument("--conf", type=float, default=0.15, help="detection confidence threshold (default 0.15)")
+    p.add_argument("--conf", type=float, default=0.25, help="detection confidence threshold (default 0.25)")
     p.add_argument("--imgsz", type=int, default=320, help="YOLO inference image size (default 320 for speed)")
     p.add_argument("--target-id", type=str, default=None, help="specific marker class to track (e.g. '41')")
     p.add_argument("--cam", type=int, default=CAM_INDEX, help="camera device index (default 0)")
@@ -1227,6 +1229,8 @@ def run_loop(cam_reader, yolo_worker, aruco_detectors, K, dist, marker_size, arg
         if not ok or frame is None:
             time.sleep(0.01)
             continue
+        if frame.ndim == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
         t_now = time.perf_counter()
         frame_no += 1
