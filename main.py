@@ -41,6 +41,8 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
+
+
 import cv2
 import numpy as np
 import torch
