@@ -1386,6 +1386,16 @@ def run_loop(cam_reader, yolo_worker, aruco_detectors, K, dist, marker_size, arg
             if c_draw is not None:
                 cv2.polylines(view, [c_draw.astype(np.int32)], True, (0, 255, 0), 2)
 
+            # Four dots in four corners of the bounding box
+            bbox_corners = [
+                (x1_m, y1_m),  # Top-left
+                (x2_m, y1_m),  # Top-right
+                (x2_m, y2_m),  # Bottom-right
+                (x1_m, y2_m),  # Bottom-left
+            ]
+            for pt in bbox_corners:
+                cv2.circle(view, pt, 5, (0, 255, 0), -1)
+
             cv2.circle(view, (tcx_render, tcy_render), 4, (0, 0, 255), -1)
             cv2.line(view, (cx_render, cy), (tcx_render, tcy_render), (0, 255, 0), 1)
 
