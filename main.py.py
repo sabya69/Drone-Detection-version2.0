@@ -282,21 +282,30 @@ def resolve_model_file(requested_path=None):
 
 
 def init_aruco_detectors():
-    """Initializes OpenCV ArUco detectors for ultra-fast native detection (3-5ms on Pi)."""
+    """Initializes OpenCV ArUco detectors for ultra-fast native detection (3-5ms on Pi/PC)."""
     detectors = []
     if not hasattr(cv2, "aruco"):
         return detectors
+    # Primary dictionary is DICT_4X4_100 (contains all 4X4_50 markers plus 50 more), followed by 5X5 and 6X6
     dict_ids = [
-        cv2.aruco.DICT_4X4_50,
         cv2.aruco.DICT_4X4_100,
         cv2.aruco.DICT_5X5_50,
         cv2.aruco.DICT_6X6_50,
     ]
     try:
-        params = cv2.aruco.DetectorParameters()
         has_detector_class = hasattr(cv2.aruco, "ArucoDetector")
         for d_id in dict_ids:
             d = cv2.aruco.getPredefinedDictionary(d_id)
+            params = cv2.aruco.DetectorParameters()
+            params.adaptiveThreshWinSizeMin = 3
+            params.adaptiveThreshWinSizeMax = 23
+            params.adaptiveThreshWinSizeStep = 10  # Optimal 3-step scan (3, 13, 23) in 4.4ms!
+            params.adaptiveThreshConstant = 7.0
+            params.minMarkerPerimeterRate = 0.02
+            params.polygonalApproxAccuracyRate = 0.05
+            params.maxErroneousBitsInBorderRate = 0.50
+            params.errorCorrectionRate = 0.8
+            params.cornerRefinementMethod = 0  # Zero overhead during detection
             if has_detector_class:
                 det = cv2.aruco.ArucoDetector(d, params)
                 detectors.append(("new", det))
@@ -308,10 +317,11 @@ def init_aruco_detectors():
 
 
 def fast_detect_aruco(frame, aruco_detectors, target_id=None):
-    """Native OpenCV ArUco detector (runs in ~3-5ms on Raspberry Pi CPU)."""
+    """Native OpenCV ArUco detector (runs in ~3-5ms)."""
     if not aruco_detectors:
         return None
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
     for mode, item in aruco_detectors:
         try:
             if mode == "new":
@@ -353,12 +363,11 @@ def fast_detect_aruco(frame, aruco_detectors, target_id=None):
 
 
 def refine_with_aruco(frame, box, aruco_detectors, target_id=None):
-    """Verify and extract subpixel corners from a detected candidate box.
-    Returns (corners, detected_id) if a verified ArUco marker is found inside the crop, else (None, None)."""
+    """Verify and extract corners from a detected candidate crop (runs in ~1ms)."""
     if not aruco_detectors:
         return None, None
     x1, y1, x2, y2 = [int(v) for v in box]
-    pad = 16
+    pad = 12
     h_img, w_img = frame.shape[:2]
     rx1, ry1 = max(0, x1 - pad), max(0, y1 - pad)
     rx2, ry2 = min(w_img, x2 + pad), min(h_img, y2 + pad)
@@ -367,32 +376,25 @@ def refine_with_aruco(frame, box, aruco_detectors, target_id=None):
         return None, None
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    variants = [gray]
-    try:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        variants.append(clahe.apply(gray))
-    except Exception:
-        pass
 
-    for img_variant in variants:
-        for mode, item in aruco_detectors:
-            try:
-                if mode == "new":
-                    corners, ids, _ = item.detectMarkers(img_variant)
-                else:
-                    d, params = item
-                    corners, ids, _ = cv2.aruco.detectMarkers(img_variant, d, parameters=params)
-                if ids is not None and len(ids) > 0:
-                    for idx, c_arr in enumerate(corners):
-                        cur_id = str(ids[idx][0])
-                        if target_id is not None and cur_id != str(target_id):
-                            continue
-                        c = c_arr[0].copy().astype(np.float64)
-                        c[:, 0] += rx1
-                        c[:, 1] += ry1
-                        return c, cur_id
-            except Exception:
-                continue
+    for mode, item in aruco_detectors[:2]:
+        try:
+            if mode == "new":
+                corners, ids, _ = item.detectMarkers(gray)
+            else:
+                d, params = item
+                corners, ids, _ = cv2.aruco.detectMarkers(gray, d, parameters=params)
+            if ids is not None and len(ids) > 0:
+                for idx, c_arr in enumerate(corners):
+                    cur_id = str(ids[idx][0])
+                    if target_id is not None and cur_id != str(target_id):
+                        continue
+                    c = c_arr[0].copy().astype(np.float64)
+                    c[:, 0] += rx1
+                    c[:, 1] += ry1
+                    return c, cur_id
+        except Exception:
+            continue
     return None, None
 
 
@@ -727,8 +729,8 @@ class AsyncYoloWorker:
 
     def get_latest(self):
         with self.lock:
-            # If inference results are older than 0.35 seconds, treat as expired to avoid ghost tracking
-            if time.perf_counter() - self.last_infer_time > 0.35:
+            # If inference results are older than 0.75 seconds, treat as expired to avoid ghost tracking
+            if time.perf_counter() - self.last_infer_time > 0.75:
                 return None, self.infer_ms
             return self.latest_boxes, self.infer_ms
 
@@ -1062,7 +1064,7 @@ def main():
                    help=f"marker side length in metres (default {DEFAULT_MARKER_SIZE:.2f} m)")
     p.add_argument("--ipd", type=float, default=None, help="alias for --marker-size")
     p.add_argument("--cal-dist", type=float, default=1.0, help="distance in metres when calibrating (c)")
-    p.add_argument("--conf", type=float, default=0.25, help="detection confidence threshold (default 0.25)")
+    p.add_argument("--conf", type=float, default=0.15, help="detection confidence threshold (default 0.15)")
     p.add_argument("--imgsz", type=int, default=320, help="YOLO inference image size (default 320 for speed)")
     p.add_argument("--target-id", type=str, default=None, help="specific marker class to track (e.g. '41')")
     p.add_argument("--cam", type=int, default=CAM_INDEX, help="camera device index (default 0)")
@@ -1087,12 +1089,11 @@ def main():
                    help="log every frame to CSV even when no target is detected")
     p.add_argument("--aruco-only", action="store_true", default=False,
                    help="disable YOLO, run fast native ArUco detector only (zero false positives, 30+ FPS)")
-    p.add_argument("--no-verify-aruco", action="store_true", default=False,
-                   help="disable strict ArUco verification of YOLO bounding boxes")
+    p.add_argument("--verify-aruco", action="store_true", default=False,
+                   help="strictly require ArUco confirmation for YOLO bounding boxes (default: False)")
 
     args = p.parse_args()
 
-    args.verify_aruco = not args.no_verify_aruco
     if args.aruco_only:
         app_state.enable_yolo = False
 
@@ -1283,7 +1284,7 @@ def run_loop(cam_reader, yolo_worker, aruco_detectors, K, dist, marker_size, arg
                 if detected_candidates:
                     # Sort candidates by confidence and area
                     candidates_sorted = sorted(detected_candidates, key=lambda c: (c["conf"], c["area"]), reverse=True)
-                    for cand in candidates_sorted:
+                    for cand in candidates_sorted[:2]:
                         cand_box = cand["box"]
                         bw = cand_box[2] - cand_box[0]
                         bh = cand_box[3] - cand_box[1]
@@ -1295,26 +1296,32 @@ def run_loop(cam_reader, yolo_worker, aruco_detectors, K, dist, marker_size, arg
 
                         c_ref, aruco_id = refine_with_aruco(frame, cand_box, aruco_detectors, target_id=args.target_id)
 
-                        # Strict verification: require ArUco confirmation to prevent false detections on faces or objects
-                        if getattr(args, "verify_aruco", True):
-                            if c_ref is not None:
-                                detected_target = {
-                                    "box": cand_box,
-                                    "corners": c_ref,
-                                    "cls_name": aruco_id if aruco_id else cand["cls_name"],
-                                    "conf": cand["conf"],
-                                    "detector": "yolo+aruco"
-                                }
-                                break
-                        else:
-                            # Fallback if --no-verify-aruco is explicitly passed
+                        if c_ref is not None:
                             detected_target = {
                                 "box": cand_box,
                                 "corners": c_ref,
                                 "cls_name": aruco_id if aruco_id else cand["cls_name"],
                                 "conf": cand["conf"],
+                                "detector": "yolo+aruco"
+                            }
+                            active_detector = f"YOLO+ArUco ({infer_ms:.0f}ms)"
+                            break
+                        elif not getattr(args, "verify_aruco", False):
+                            # Robust fallback: YOLO detected the marker
+                            c_box = np.array([
+                                [cand_box[0], cand_box[1]],
+                                [cand_box[2], cand_box[1]],
+                                [cand_box[2], cand_box[3]],
+                                [cand_box[0], cand_box[3]],
+                            ], dtype=np.float64)
+                            detected_target = {
+                                "box": cand_box,
+                                "corners": c_box,
+                                "cls_name": cand["cls_name"],
+                                "conf": cand["conf"],
                                 "detector": "yolo"
                             }
+                            active_detector = f"Async YOLO ({infer_ms:.0f}ms)"
                             break
         elif detected_target is not None and app_state.enable_yolo:
             # Keep YOLO warm periodically
